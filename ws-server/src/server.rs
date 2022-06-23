@@ -402,8 +402,8 @@ where
 			match futures_util::future::select(rx_item, next_ping).await {
 				Either::Left((Some(response), ping)) => {
 					let response = match response {
-						Message::Any(m) => m,
-						Message::M { method, started_at, response } => {
+						Message::CallOrNotification(m) => m,
+						Message::CallNeedsMiddleware { method, started_at, response } => {
 							middleware2.on_response(&response.result, started_at);
 							middleware2.on_result(&method, response.success, started_at);
 
@@ -478,7 +478,7 @@ where
 							maximum
 						);
 						let err = MethodResponse::error(Id::Null, reject_too_big_request(max_request_body_size));
-						let _ = tx.unbounded_send(Message::Any(err.result));
+						let _ = tx.unbounded_send(Message::CallOrNotification(err.result));
 						continue;
 					}
 					// These errors can not be gracefully handled, so just log them and terminate the connection.
@@ -521,7 +521,7 @@ where
 
 					if let Some(r) = response {
 						middleware.on_response(&r.result, request_start);
-						let _ = tx.unbounded_send(Message::Any(r.result));
+						let _ = tx.unbounded_send(Message::CallOrNotification(r.result));
 					}
 				}
 				.boxed();
@@ -534,7 +534,7 @@ where
 					ErrorObject::borrowed(BATCHES_NOT_SUPPORTED_CODE, &BATCHES_NOT_SUPPORTED_MSG, None),
 				);
 				middleware.on_response(&response.result, request_start);
-				let _ = tx.unbounded_send(Message::Any(response.result));
+				let _ = tx.unbounded_send(Message::CallOrNotification(response.result));
 			}
 			Some(b'[') => {
 				// Make sure the following variables are not moved into async closure below.
@@ -565,14 +565,14 @@ where
 
 					tx_log_from_str(&response.result, max_log_length);
 					middleware.on_response(&response.result, request_start);
-					let _ = tx.unbounded_send(Message::Any(response.result));
+					let _ = tx.unbounded_send(Message::CallOrNotification(response.result));
 				};
 
 				method_executors.add(Box::pin(fut));
 			}
 			_ => {
 				let err = MethodResponse::error(Id::Null, ErrorObject::from(ErrorCode::ParseError));
-				let _ = tx.unbounded_send(Message::Any(err.result));
+				let _ = tx.unbounded_send(Message::CallOrNotification(err.result));
 			}
 		}
 	};
@@ -903,7 +903,7 @@ where
 
 			while let Some(m) = rx.next().await {
 				let response = match m {
-					Message::M { response, .. } => response,
+					Message::CallNeedsMiddleware { response, .. } => response,
 					_ => todo!(),
 				};
 

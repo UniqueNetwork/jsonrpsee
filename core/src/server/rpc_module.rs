@@ -81,10 +81,11 @@ pub type ConnectionId = usize;
 /// Max response size.
 pub type MaxResponseSize = usize;
 
+/// Enum that represent whether a call needs to logged in the middleware or not.
 #[derive(Debug)]
 pub enum Message {
-	Any(String),
-	M { method: String, started_at: std::time::Instant, response: MethodResponse },
+	CallOrNotification(String),
+	CallNeedsMiddleware { method: String, started_at: std::time::Instant, response: MethodResponse },
 }
 
 /// Raw response from an RPC
@@ -446,8 +447,8 @@ impl Methods {
 				let result = rx_sink.next().await.expect("sender still alive; qed");
 
 				match result {
-					Message::Any(m) => panic!("should not happen"),
-					Message::M { method, started_at, response } => response,
+					Message::CallOrNotification(m) => panic!("should not happen"),
+					Message::CallNeedsMiddleware { method, started_at, response } => response,
 				}
 			}
 			Some(MethodKind::Unsubscription(cb)) => (cb)(id, params, 0, usize::MAX),
@@ -844,7 +845,12 @@ impl PendingSubscription {
 		if let Some(inner) = self.0.take() {
 			let InnerPendingSubscription { sink, id, method, instant, .. } = inner;
 			let err = MethodResponse::error(id, err.into());
-			sink.unbounded_send(Message::M { method: method.to_string(), started_at: instant, response: err }).is_ok()
+			sink.unbounded_send(Message::CallNeedsMiddleware {
+				method: method.to_string(),
+				started_at: instant,
+				response: err,
+			})
+			.is_ok()
 		} else {
 			false
 		}
@@ -861,7 +867,7 @@ impl PendingSubscription {
 
 		let response = MethodResponse::response(id, &uniq_sub.sub_id, usize::MAX);
 
-		let msg = Message::M { method: method.to_string(), started_at: instant, response };
+		let msg = Message::CallNeedsMiddleware { method: method.to_string(), started_at: instant, response };
 
 		if sink.unbounded_send(msg).is_ok() {
 			let (unsubscribe_tx, unsubscribe_rx) = watch::channel(());
@@ -889,7 +895,7 @@ impl Drop for PendingSubscription {
 			let InnerPendingSubscription { sink, id, method, instant, .. } = inner;
 			let response = MethodResponse::error(id, ErrorObject::from(ErrorCode::InvalidParams));
 
-			let msg = Message::M { method: method.to_string(), started_at: instant, response };
+			let msg = Message::CallNeedsMiddleware { method: method.to_string(), started_at: instant, response };
 
 			let _ = sink.unbounded_send(msg);
 		}
@@ -929,7 +935,7 @@ impl SubscriptionSink {
 		}
 
 		let msg = self.build_message(result)?;
-		Ok(self.inner.unbounded_send(Message::Any(msg)).is_ok())
+		Ok(self.inner.unbounded_send(Message::CallOrNotification(msg)).is_ok())
 	}
 
 	/// Reads data from the `stream` and sends back data on the subscription
@@ -1108,7 +1114,7 @@ impl SubscriptionSink {
 				tracing::debug!("Closing subscription: {:?}", self.uniq_sub.sub_id);
 
 				let msg = self.build_error_message(&err.into()).expect("valid json infallible; qed");
-				return sink.unbounded_send(Message::Any(msg)).is_ok();
+				return sink.unbounded_send(Message::CallOrNotification(msg)).is_ok();
 			}
 		}
 		false
@@ -1166,7 +1172,7 @@ impl Subscription {
 		tracing::debug!("rx: {:?}", raw);
 
 		let raw = match raw {
-			Message::Any(m) => m,
+			Message::CallOrNotification(m) => m,
 			_ => todo!(),
 		};
 
