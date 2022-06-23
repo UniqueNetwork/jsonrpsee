@@ -29,12 +29,12 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::future::{FutureDriver, ServerHandle, StopMonitor};
 use crate::types::error::{ErrorCode, ErrorObject, BATCHES_NOT_SUPPORTED_CODE, BATCHES_NOT_SUPPORTED_MSG};
 use crate::types::{Id, Request};
-use futures_channel::mpsc;
+use futures_channel::mpsc::{self, unbounded, UnboundedSender};
 use futures_util::future::{Either, FutureExt};
 use futures_util::io::{BufReader, BufWriter};
 use futures_util::stream::StreamExt;
@@ -47,9 +47,7 @@ use jsonrpsee_core::server::helpers::{
 	prepare_error, BatchResponse, BatchResponseBuilder, BoundedSubscriptions, MethodResponse, MethodSink,
 };
 use jsonrpsee_core::server::resource_limiting::Resources;
-use jsonrpsee_core::server::rpc_module::{
-	pending_subscription_channel, ConnState, ConnectionId, MethodKind, Methods, PendingSubscriptionCallTx,
-};
+use jsonrpsee_core::server::rpc_module::{ConnState, ConnectionId, Message, MethodKind, Methods};
 use jsonrpsee_core::tracing::{rx_log_from_json, tx_log_from_str, RpcTracing};
 use jsonrpsee_core::traits::IdProvider;
 use jsonrpsee_core::{Error, TEN_MB_SIZE_BYTES};
@@ -89,7 +87,10 @@ impl<M> std::fmt::Debug for Server<M> {
 	}
 }
 
-impl<M: Middleware> Server<M> {
+impl<M> Server<M>
+where
+	M: Middleware,
+{
 	/// Returns socket address to which the server is bound.
 	pub fn local_addr(&self) -> Result<SocketAddr, Error> {
 		self.listener.local_addr().map_err(Into::into)
@@ -233,7 +234,10 @@ enum HandshakeResponse<'a, M> {
 	},
 }
 
-async fn handshake<M: Middleware>(socket: tokio::net::TcpStream, mode: HandshakeResponse<'_, M>) -> Result<(), Error> {
+async fn handshake<M>(socket: tokio::net::TcpStream, mode: HandshakeResponse<'_, M>) -> Result<(), Error>
+where
+	M: Middleware,
+{
 	let remote_addr = socket.peer_addr()?;
 
 	// For each incoming background_task we perform a handshake.
@@ -347,7 +351,10 @@ struct BackgroundTask<'a, M> {
 	headers: HeaderMap,
 }
 
-async fn background_task<M: Middleware>(input: BackgroundTask<'_, M>) -> Result<(), Error> {
+async fn background_task<M>(input: BackgroundTask<'_, M>) -> Result<(), Error>
+where
+	M: Middleware,
+{
 	let BackgroundTask {
 		server,
 		conn_id,
@@ -370,14 +377,15 @@ async fn background_task<M: Middleware>(input: BackgroundTask<'_, M>) -> Result<
 	let mut builder = server.into_builder();
 	builder.set_max_message_size(max_request_body_size as usize);
 	let (mut sender, mut receiver) = builder.finish();
-	let (tx, mut rx) = mpsc::unbounded::<String>();
+	let (tx, mut rx) = mpsc::unbounded::<Message>();
 	let bounded_subscriptions2 = bounded_subscriptions.clone();
 
 	let stop_server2 = stop_server.clone();
-	let sink = MethodSink::new_with_limit(tx, max_response_body_size, max_log_length);
+	//let sink = MethodSink::new_with_limit(tx, max_response_body_size, max_log_length);
 
 	middleware.on_connect();
 
+	let middleware2 = middleware.clone();
 	// Send results back to the client.
 	tokio::spawn(async move {
 		// Received messages from the WebSocket.
@@ -393,6 +401,16 @@ async fn background_task<M: Middleware>(input: BackgroundTask<'_, M>) -> Result<
 			// Note: Although, this is cancel-safe already, avoid using `select!` macro for future proofing.
 			match futures_util::future::select(rx_item, next_ping).await {
 				Either::Left((Some(response), ping)) => {
+					let response = match response {
+						Message::Any(m) => m,
+						Message::M { method, started_at, response } => {
+							middleware2.on_response(&response.result, started_at);
+							middleware2.on_result(&method, response.success, started_at);
+
+							response.result
+						}
+					};
+
 					// If websocket message send fail then terminate the connection.
 					if let Err(err) = send_ws_message(&mut sender, response).await {
 						tracing::warn!("WS send error: {}; terminate connection", err);
@@ -450,7 +468,7 @@ async fn background_task<M: Middleware>(input: BackgroundTask<'_, M>) -> Result<
 				match err {
 					MonitoredError::Selector(SokettoError::Closed) => {
 						tracing::debug!("WS transport: remote peer terminated the connection: {}", conn_id);
-						sink.close();
+						tx.close_channel();
 						break Ok(());
 					}
 					MonitoredError::Selector(SokettoError::MessageTooLarge { current, maximum }) => {
@@ -459,13 +477,14 @@ async fn background_task<M: Middleware>(input: BackgroundTask<'_, M>) -> Result<
 							current,
 							maximum
 						);
-						sink.send_error(Id::Null, reject_too_big_request(max_request_body_size));
+						let err = MethodResponse::error(Id::Null, reject_too_big_request(max_request_body_size));
+						let _ = tx.unbounded_send(Message::Any(err.result));
 						continue;
 					}
 					// These errors can not be gracefully handled, so just log them and terminate the connection.
 					MonitoredError::Selector(err) => {
 						tracing::warn!("WS error: {}; terminate connection {}", err, conn_id);
-						sink.close();
+						tx.close_channel();
 						break Err(err.into());
 					}
 					MonitoredError::Shutdown => break Ok(()),
@@ -479,7 +498,7 @@ async fn background_task<M: Middleware>(input: BackgroundTask<'_, M>) -> Result<
 		match first_non_whitespace {
 			Some(b'{') => {
 				let data = std::mem::take(&mut data);
-				let sink = sink.clone();
+				let tx = tx.clone();
 				let resources = &resources;
 				let methods = &methods;
 				let bounded_subscriptions = bounded_subscriptions.clone();
@@ -493,19 +512,16 @@ async fn background_task<M: Middleware>(input: BackgroundTask<'_, M>) -> Result<
 						max_log_length,
 						methods: &methods,
 						bounded_subscriptions,
-						sink: &sink,
 						id_provider: &*id_provider,
 						middleware,
 						request_start,
 					};
 
-					let (response, maybe_pending_sub_tx) = process_single_request(data, call).await;
-					middleware.on_response(&response.result, request_start);
+					let response = process_single_request(data, tx.clone(), call).await;
 
-					let _ = sink.send_raw(response.result);
-
-					if let Some(pending_sub_tx) = maybe_pending_sub_tx {
-						pending_sub_tx.accept();
+					if let Some(r) = response {
+						middleware.on_response(&r.result, request_start);
+						let _ = tx.unbounded_send(Message::Any(r.result));
 					}
 				}
 				.boxed();
@@ -518,14 +534,15 @@ async fn background_task<M: Middleware>(input: BackgroundTask<'_, M>) -> Result<
 					ErrorObject::borrowed(BATCHES_NOT_SUPPORTED_CODE, &BATCHES_NOT_SUPPORTED_MSG, None),
 				);
 				middleware.on_response(&response.result, request_start);
-				let _ = sink.send_raw(response.result);
+				let _ = tx.unbounded_send(Message::Any(response.result));
 			}
 			Some(b'[') => {
 				// Make sure the following variables are not moved into async closure below.
 				let resources = &resources;
 				let methods = &methods;
 				let bounded_subscriptions = bounded_subscriptions.clone();
-				let sink = sink.clone();
+				let tx = tx.clone();
+
 				let id_provider = id_provider.clone();
 				let data = std::mem::take(&mut data);
 
@@ -539,7 +556,6 @@ async fn background_task<M: Middleware>(input: BackgroundTask<'_, M>) -> Result<
 							max_log_length,
 							methods,
 							bounded_subscriptions,
-							sink: &sink,
 							id_provider: &*id_provider,
 							middleware,
 							request_start,
@@ -549,13 +565,14 @@ async fn background_task<M: Middleware>(input: BackgroundTask<'_, M>) -> Result<
 
 					tx_log_from_str(&response.result, max_log_length);
 					middleware.on_response(&response.result, request_start);
-					let _ = sink.send_raw(response.result);
+					let _ = tx.unbounded_send(Message::Any(response.result));
 				};
 
 				method_executors.add(Box::pin(fut));
 			}
 			_ => {
-				sink.send_error(Id::Null, ErrorCode::ParseError.into());
+				let err = MethodResponse::error(Id::Null, ErrorObject::from(ErrorCode::ParseError));
+				let _ = tx.unbounded_send(Message::Any(err.result));
 			}
 		}
 	};
@@ -673,7 +690,7 @@ impl<M> Builder<M> {
 	/// Register a new resource kind. Errors if `label` is already registered, or if the number of
 	/// registered resources on this server instance would exceed 8.
 	///
-	/// See the module documentation for [`resurce_limiting`](../jsonrpsee_utils/server/resource_limiting/index.html#resource-limiting)
+	/// See the module documentation for [`resource_limiting`](../jsonrpsee_utils/server/resource_limiting/index.html#resource-limiting)
 	/// for details.
 	pub fn register_resource(mut self, label: &'static str, capacity: u16, default: u16) -> Result<Self, Error> {
 		self.resources.register(label, capacity, default)?;
@@ -835,8 +852,7 @@ struct CallData<'a, M: Middleware> {
 	max_response_body_size: u32,
 	max_log_length: u32,
 	resources: &'a Resources,
-	sink: &'a MethodSink,
-	request_start: M::Instant,
+	request_start: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -845,6 +861,7 @@ struct Call<'a, M: Middleware> {
 	name: &'a str,
 	call: CallData<'a, M>,
 	id: Id<'a>,
+	tx: &'a UnboundedSender<Message>,
 }
 
 // Batch responses must be sent back as a single message so we read the results from each
@@ -858,28 +875,40 @@ where
 
 	if let Ok(batch) = serde_json::from_slice::<Vec<Request>>(&data) {
 		return if !batch.is_empty() {
-			let batch = batch.into_iter().map(|req| (req, call.clone()));
+			let (tx, mut rx) = mpsc::unbounded::<Message>();
+
+			let batch = batch.into_iter().map(|req| (req, call.clone(), tx.clone()));
 			let batch_stream = futures_util::stream::iter(batch);
 
 			let trace = RpcTracing::batch();
 			let _enter = trace.span().enter();
 
-			let batch_response = batch_stream
-				.fold(BatchResponseBuilder::new(), |mut batch_response, (req, call)| async move {
+			let mut batch_response = batch_stream
+				.fold(BatchResponseBuilder::new(), |mut batch_response, (req, call, tx)| async move {
 					let params = Params::new(req.params.map(|params| params.get()));
 
-					let (response, maybe_pending_sub_tx) =
-						execute_call(Call { name: &req.method, params, id: req.id, call }).in_current_span().await;
+					let response = execute_call(Call { name: &req.method, params, id: req.id, call, tx: &tx })
+						.in_current_span()
+						.await;
 
-					if let Some(pending_sub_tx) = maybe_pending_sub_tx {
-						pending_sub_tx.accept();
+					if let Some(r) = response.as_ref() {
+						batch_response.append(&r);
 					}
-
-					batch_response.append(&response);
 
 					batch_response
 				})
 				.await;
+
+			rx.close();
+
+			while let Some(m) = rx.next().await {
+				let response = match m {
+					Message::M { response, .. } => response,
+					_ => todo!(),
+				};
+
+				batch_response.append(&response);
+			}
 
 			return batch_response.finish();
 		} else {
@@ -893,8 +922,9 @@ where
 
 async fn process_single_request<M: Middleware>(
 	data: Vec<u8>,
+	tx: UnboundedSender<Message>,
 	call: CallData<'_, M>,
-) -> (MethodResponse, Option<PendingSubscriptionCallTx>) {
+) -> Option<MethodResponse> {
 	if let Ok(req) = serde_json::from_slice::<Request>(&data) {
 		let trace = RpcTracing::method_call(&req.method);
 		let _enter = trace.span().enter();
@@ -905,10 +935,10 @@ async fn process_single_request<M: Middleware>(
 		let name = &req.method;
 		let id = req.id;
 
-		execute_call(Call { name, params, id, call }).in_current_span().await
+		execute_call(Call { name, params, id, call, tx: &tx }).in_current_span().await
 	} else {
 		let (id, code) = prepare_error(&data);
-		(MethodResponse::error(id, ErrorObject::from(code)), None)
+		Some(MethodResponse::error(id, ErrorObject::from(code)))
 	}
 }
 
@@ -917,8 +947,8 @@ async fn process_single_request<M: Middleware>(
 ///
 /// Returns `(MethodResponse, None)` on every call that isn't a subscription
 /// Otherwise `(MethodResponse, Some(PendingSubscriptionCallTx)`.
-async fn execute_call<M: Middleware>(c: Call<'_, M>) -> (MethodResponse, Option<PendingSubscriptionCallTx>) {
-	let Call { name, id, params, call } = c;
+async fn execute_call<M: Middleware>(c: Call<'_, M>) -> Option<MethodResponse> {
+	let Call { name, id, params, call, tx } = c;
 	let CallData {
 		resources,
 		methods,
@@ -928,63 +958,64 @@ async fn execute_call<M: Middleware>(c: Call<'_, M>) -> (MethodResponse, Option<
 		conn_id,
 		bounded_subscriptions,
 		id_provider,
-		sink,
 		request_start,
 	} = call;
 
 	middleware.on_call(name, params.clone());
 
 	let response = match methods.method_with_name(name) {
-		None => (MethodResponse::error(id, ErrorObject::from(ErrorCode::MethodNotFound)), None),
+		None => Some(MethodResponse::error(id, ErrorObject::from(ErrorCode::MethodNotFound))),
 		Some((name, method)) => match &method.inner() {
 			MethodKind::Sync(callback) => match method.claim(name, resources) {
 				Ok(guard) => {
 					let r = (callback)(id, params, max_response_body_size as usize);
 					drop(guard);
-					(r, None)
+					Some(r)
 				}
 				Err(err) => {
 					tracing::error!("[Methods::execute_with_resources] failed to lock resources: {:?}", err);
-					(MethodResponse::error(id, ErrorObject::from(ErrorCode::ServerIsBusy)), None)
+					Some(MethodResponse::error(id, ErrorObject::from(ErrorCode::ServerIsBusy)))
 				}
 			},
 			MethodKind::Async(callback) => match method.claim(name, resources) {
 				Ok(guard) => {
 					let id = id.into_owned();
 					let params = params.into_owned();
-
-					((callback)(id, params, conn_id, max_response_body_size as usize, Some(guard)).await, None)
+					let r = (callback)(id, params, conn_id, max_response_body_size as usize, Some(guard)).await;
+					Some(r)
 				}
 				Err(err) => {
 					tracing::error!("[Methods::execute_with_resources] failed to lock resources: {:?}", err);
-					(MethodResponse::error(id, ErrorObject::from(ErrorCode::ServerIsBusy)), None)
+					Some(MethodResponse::error(id, ErrorObject::from(ErrorCode::ServerIsBusy)))
 				}
 			},
 			MethodKind::Subscription(callback) => match method.claim(name, resources) {
 				Ok(guard) => {
 					if let Some(cn) = bounded_subscriptions.acquire() {
 						let conn_state = ConnState { conn_id, close_notify: cn, id_provider };
-						let (pending_sub_tx, pending_sub_rx) = pending_subscription_channel();
-						let result =
-							callback(id.clone(), params, sink.clone(), conn_state, pending_sub_rx, Some(guard)).await;
-						(result, Some(pending_sub_tx))
+						callback(id.clone(), params, tx.clone(), conn_state, Some(guard), request_start);
+						None
 					} else {
-						(MethodResponse::error(id, reject_too_many_subscriptions(bounded_subscriptions.max())), None)
+						Some(MethodResponse::error(id, reject_too_many_subscriptions(bounded_subscriptions.max())))
 					}
 				}
 				Err(err) => {
 					tracing::error!("[Methods::execute_with_resources] failed to lock resources: {:?}", err);
-					(MethodResponse::error(id, ErrorObject::from(ErrorCode::ServerIsBusy)), None)
+					Some(MethodResponse::error(id, ErrorObject::from(ErrorCode::ServerIsBusy)))
 				}
 			},
 			MethodKind::Unsubscription(callback) => {
 				// Don't adhere to any resource or subscription limits; always let unsubscribing happen!
-				(callback(id, params, conn_id, max_response_body_size as usize), None)
+				Some(callback(id, params, conn_id, max_response_body_size as usize))
 			}
 		},
 	};
 
-	tx_log_from_str(&response.0.result, max_log_length);
-	middleware.on_result(name, response.0.success, request_start);
+	// HACK: middleware logging here
+	if let Some(r) = response.as_ref() {
+		tx_log_from_str(&r.result, max_log_length);
+		middleware.on_result(name, r.success, request_start);
+	}
+
 	response
 }

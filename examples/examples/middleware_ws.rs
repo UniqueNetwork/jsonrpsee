@@ -37,9 +37,7 @@ use jsonrpsee::ws_server::{RpcModule, WsServerBuilder};
 struct Timings;
 
 impl middleware::Middleware for Timings {
-	type Instant = Instant;
-
-	fn on_request(&self, remote_addr: SocketAddr, headers: &HeaderMap) -> Self::Instant {
+	fn on_request(&self, remote_addr: SocketAddr, headers: &HeaderMap) -> Instant {
 		println!("[Middleware::on_request] remote_addr {}, headers: {:?}", remote_addr, headers);
 		Instant::now()
 	}
@@ -48,11 +46,11 @@ impl middleware::Middleware for Timings {
 		println!("[Middleware::on_call] method: '{}' params: {:?}", name, params);
 	}
 
-	fn on_result(&self, name: &str, succeess: bool, started_at: Self::Instant) {
+	fn on_result(&self, name: &str, succeess: bool, started_at: Instant) {
 		println!("[Middleware::on_result] '{}', worked? {}, time elapsed {:?}", name, succeess, started_at.elapsed());
 	}
 
-	fn on_response(&self, result: &str, started_at: Self::Instant) {
+	fn on_response(&self, result: &str, started_at: Instant) {
 		println!("[Middleware::on_response] result: {}, time elapsed {:?}", result, started_at.elapsed());
 	}
 }

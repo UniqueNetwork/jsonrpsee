@@ -27,6 +27,7 @@
 //! Middleware for `jsonrpsee` servers.
 
 use jsonrpsee_types::Params;
+use std::time::Instant;
 
 /// Defines a middleware with callbacks during the RPC request life-cycle. The primary use case for
 /// this is to collect timings for a larger metrics collection solution but the only constraints on
@@ -37,43 +38,47 @@ use jsonrpsee_types::Params;
 /// or the [`HttpServerBuilder::set_middleware`](../../jsonrpsee_http_server/struct.HttpServerBuilder.html#method.set_middleware) method
 /// for examples.
 pub trait Middleware: Send + Sync + Clone + 'static {
+	/*
 	/// Intended to carry timestamp of a request, for example `std::time::Instant`. How the middleware
 	/// measures time, if at all, is entirely up to the implementation.
 	type Instant: std::fmt::Debug + Send + Sync + Copy;
+	*/
 
 	/// Called when a new client connects (WebSocket only)
 	fn on_connect(&self) {}
 
 	/// Called when a new JSON-RPC request comes to the server.
-	fn on_request(&self, remote_addr: std::net::SocketAddr, headers: &http::HeaderMap) -> Self::Instant;
+	fn on_request(&self, remote_addr: std::net::SocketAddr, headers: &http::HeaderMap) -> Instant;
 
 	/// Called on each JSON-RPC method call, batch requests will trigger `on_call` multiple times.
 	fn on_call(&self, _name: &str, _params: Params) {}
 
 	/// Called on each JSON-RPC method completion, batch requests will trigger `on_result` multiple times.
-	fn on_result(&self, _name: &str, _success: bool, _started_at: Self::Instant) {}
+	fn on_result(&self, _name: &str, _success: bool, _started_at: Instant) {}
 
 	/// Called once the JSON-RPC request is finished and response is sent to the output buffer.
-	fn on_response(&self, _result: &str, _started_at: Self::Instant) {}
+	fn on_response(&self, _result: &str, _started_at: Instant) {}
 
 	/// Called when a client disconnects (WebSocket only)
 	fn on_disconnect(&self) {}
 }
 
 impl Middleware for () {
-	type Instant = ();
+	//type Instant = ();
 
-	fn on_request(&self, _ip_addr: std::net::SocketAddr, _headers: &http::HeaderMap) -> Self::Instant {}
+	fn on_request(&self, _ip_addr: std::net::SocketAddr, _headers: &http::HeaderMap) -> Instant {
+		Instant::now()
+	}
 }
 
-impl<A, B> Middleware for (A, B)
+/*impl<A, B> Middleware for (A, B)
 where
 	A: Middleware,
 	B: Middleware,
 {
-	type Instant = (A::Instant, B::Instant);
+	//type Instant = (A::Instant, B::Instant);
 
-	fn on_request(&self, ip_addr: std::net::SocketAddr, headers: &http::HeaderMap) -> Self::Instant {
+	fn on_request(&self, ip_addr: std::net::SocketAddr, headers: &http::HeaderMap) -> (Instant, Instant) {
 		(self.0.on_request(ip_addr, headers), self.1.on_request(ip_addr, headers))
 	}
 
@@ -82,13 +87,13 @@ where
 		self.1.on_call(name, params);
 	}
 
-	fn on_result(&self, name: &str, success: bool, started_at: Self::Instant) {
+	fn on_result(&self, name: &str, success: bool, started_at: Instant) {
 		self.0.on_result(name, success, started_at.0);
 		self.1.on_result(name, success, started_at.1);
 	}
 
-	fn on_response(&self, result: &str, started_at: Self::Instant) {
+	fn on_response(&self, result: &str, started_at: Instant) {
 		self.0.on_response(result, started_at.0);
 		self.1.on_response(result, started_at.1);
 	}
-}
+}*/

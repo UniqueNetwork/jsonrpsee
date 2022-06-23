@@ -35,6 +35,8 @@ use jsonrpsee_types::{Id, InvalidRequest, Response};
 use serde::Serialize;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
+use super::rpc_module::Message;
+
 /// Bounded writer that allows writing at most `max_len` bytes.
 ///
 /// ```

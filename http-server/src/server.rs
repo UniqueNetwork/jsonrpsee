@@ -28,6 +28,7 @@ use std::future::Future;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use crate::response;
 use crate::response::{internal_error, malformed};
@@ -588,7 +589,7 @@ async fn process_validated_request<M: Middleware>(
 	max_response_body_size: u32,
 	max_log_length: u32,
 	batch_requests_supported: bool,
-	request_start: M::Instant,
+	request_start: Instant,
 ) -> Result<hyper::Response<hyper::Body>, HyperError> {
 	let (parts, body) = request.into_parts();
 
@@ -651,7 +652,7 @@ async fn process_health_request<M: Middleware>(
 	middleware: M,
 	methods: Methods,
 	max_response_body_size: u32,
-	request_start: M::Instant,
+	request_start: Instant,
 	max_log_length: u32,
 ) -> Result<hyper::Response<hyper::Body>, HyperError> {
 	let trace = RpcTracing::method_call(&health_api.method);
@@ -708,7 +709,7 @@ struct CallData<'a, M: Middleware> {
 	max_response_body_size: u32,
 	max_log_length: u32,
 	resources: &'a Resources,
-	request_start: M::Instant,
+	request_start: Instant,
 }
 
 #[derive(Debug, Clone)]
