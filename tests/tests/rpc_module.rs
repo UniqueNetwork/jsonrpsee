@@ -344,13 +344,13 @@ async fn subscribe_unsubscribe_without_server() {
 		let unsub_req = format!("{{\"jsonrpc\":\"2.0\",\"method\":\"my_unsub\",\"params\":[{}],\"id\":1}}", ser_id);
 		let (response, _) = module.raw_json_request(&unsub_req).await.unwrap();
 
-		assert_eq!(response, r#"{"jsonrpc":"2.0","result":true,"id":1}"#);
+		assert_eq!(response.result, r#"{"jsonrpc":"2.0","result":true,"id":1}"#);
 
 		// Unsubscribe already performed; should be error.
 		let unsub_req = format!("{{\"jsonrpc\":\"2.0\",\"method\":\"my_unsub\",\"params\":[{}],\"id\":1}}", ser_id);
 		let (response, _) = module.raw_json_request(&unsub_req).await.unwrap();
 
-		assert_eq!(response, r#"{"jsonrpc":"2.0","result":false,"id":1}"#);
+		assert_eq!(response.result, r#"{"jsonrpc":"2.0","result":false,"id":1}"#);
 	}
 
 	let sub1 = subscribe_and_assert(&module);

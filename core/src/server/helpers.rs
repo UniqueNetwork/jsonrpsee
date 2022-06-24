@@ -26,15 +26,18 @@
 
 use std::io;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::tracing::tx_log_from_str;
-use crate::{Error};
+use crate::Error;
 use futures_channel::mpsc;
 use futures_util::StreamExt;
 use jsonrpsee_types::error::{ErrorCode, ErrorObject, ErrorResponse, OVERSIZED_RESPONSE_CODE, OVERSIZED_RESPONSE_MSG};
 use jsonrpsee_types::{Id, InvalidRequest, Response};
 use serde::Serialize;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+
+use super::rpc_module::MessageWithMiddleware;
 
 /// Bounded writer that allows writing at most `max_len` bytes.
 ///
@@ -85,7 +88,7 @@ impl<'a> io::Write for &'a mut BoundedWriter {
 #[derive(Clone, Debug)]
 pub struct MethodSink {
 	/// Channel sender
-	tx: mpsc::UnboundedSender<String>,
+	tx: mpsc::UnboundedSender<MessageWithMiddleware>,
 	/// Max response size in bytes for a executed call.
 	max_response_size: u32,
 	/// Max log length.
@@ -94,12 +97,16 @@ pub struct MethodSink {
 
 impl MethodSink {
 	/// Create a new `MethodSink` with unlimited response size
-	pub fn new(tx: mpsc::UnboundedSender<String>) -> Self {
+	pub fn new(tx: mpsc::UnboundedSender<MessageWithMiddleware>) -> Self {
 		MethodSink { tx, max_response_size: u32::MAX, max_log_length: u32::MAX }
 	}
 
 	/// Create a new `MethodSink` with a limited response size
-	pub fn new_with_limit(tx: mpsc::UnboundedSender<String>, max_response_size: u32, max_log_length: u32) -> Self {
+	pub fn new_with_limit(
+		tx: mpsc::UnboundedSender<MessageWithMiddleware>,
+		max_response_size: u32,
+		max_log_length: u32,
+	) -> Self {
 		MethodSink { tx, max_response_size, max_log_length }
 	}
 
@@ -110,7 +117,7 @@ impl MethodSink {
 
 	/// Send a JSON-RPC response to the client. If the serialization of `result` exceeds `max_response_size`,
 	/// an error will be sent instead.
-	pub fn send_response(&self, id: Id, result: impl Serialize) -> bool {
+	pub fn send_response(&self, id: Id, result: impl Serialize, started_at: std::time::Instant) -> bool {
 		let mut writer = BoundedWriter::new(self.max_response_size as usize);
 
 		let json = match serde_json::to_writer(&mut writer, &Response::new(result, id.clone())) {
@@ -124,16 +131,22 @@ impl MethodSink {
 				if err.is_io() {
 					let data = format!("Exceeded max limit of {}", self.max_response_size);
 					let err = ErrorObject::owned(OVERSIZED_RESPONSE_CODE, OVERSIZED_RESPONSE_MSG, Some(data));
-					return self.send_error(id, err);
+					return self.send_error(id, err, started_at);
 				} else {
-					return self.send_error(id, ErrorCode::InternalError.into());
+					return self.send_error(id, ErrorCode::InternalError.into(), started_at);
 				}
 			}
 		};
 
 		tx_log_from_str(&json, self.max_log_length);
 
-		if let Err(err) = self.send_raw(json) {
+		let msg = MessageWithMiddleware::Call {
+			method: String::new(),
+			started_at,
+			response: MethodResponse { result: json, success: true },
+		};
+
+		if let Err(err) = self.send(msg) {
 			tracing::warn!("Error sending response {:?}", err);
 			false
 		} else {
@@ -142,7 +155,7 @@ impl MethodSink {
 	}
 
 	/// Send a JSON-RPC error to the client
-	pub fn send_error(&self, id: Id, error: ErrorObject) -> bool {
+	pub fn send_error(&self, id: Id, error: ErrorObject, started_at: std::time::Instant) -> bool {
 		let json = match serde_json::to_string(&ErrorResponse::borrowed(error, id)) {
 			Ok(json) => json,
 			Err(err) => {
@@ -154,7 +167,13 @@ impl MethodSink {
 
 		tx_log_from_str(&json, self.max_log_length);
 
-		if let Err(err) = self.send_raw(json) {
+		let msg = MessageWithMiddleware::Call {
+			method: String::new(),
+			started_at,
+			response: MethodResponse { result: json, success: false },
+		};
+
+		if let Err(err) = self.send(msg) {
 			tracing::warn!("Error sending response {:?}", err);
 		}
 
@@ -162,15 +181,14 @@ impl MethodSink {
 	}
 
 	/// Helper for sending the general purpose `Error` as a JSON-RPC errors to the client
-	pub fn send_call_error(&self, id: Id, err: Error) -> bool {
-		self.send_error(id, err.into())
+	pub fn send_call_error(&self, id: Id, err: Error, started_at: Instant) -> bool {
+		self.send_error(id, err.into(), started_at)
 	}
 
 	/// Send a raw JSON-RPC message to the client, `MethodSink` does not check verify the validity
 	/// of the JSON being sent.
-	pub fn send_raw(&self, raw_json: String) -> Result<(), mpsc::TrySendError<String>> {
-		tracing::trace!("send: {:?}", raw_json);
-		self.tx.unbounded_send(raw_json)
+	pub fn send(&self, msg: MessageWithMiddleware) -> Result<(), mpsc::TrySendError<MessageWithMiddleware>> {
+		self.tx.unbounded_send(msg)
 	}
 
 	/// Close the channel for any further messages.
@@ -186,24 +204,6 @@ pub fn prepare_error(data: &[u8]) -> (Id<'_>, ErrorCode) {
 		Ok(InvalidRequest { id }) => (id, ErrorCode::InvalidRequest),
 		Err(_) => (Id::Null, ErrorCode::ParseError),
 	}
-}
-
-/// Read all the results of all method calls in a batch request from the ['Stream']. Format the result into a single
-/// `String` appropriately wrapped in `[`/`]`.
-pub async fn collect_batch_response(rx: mpsc::UnboundedReceiver<String>) -> String {
-	let mut buf = String::with_capacity(2048);
-	buf.push('[');
-	let mut buf = rx
-		.fold(buf, |mut acc, response| async move {
-			acc.push_str(&response);
-			acc.push(',');
-			acc
-		})
-		.await;
-	// Remove trailing comma
-	buf.pop();
-	buf.push(']');
-	buf
 }
 
 /// A permitted subscription.
@@ -257,6 +257,124 @@ impl BoundedSubscriptions {
 	pub fn close(&self) {
 		self.resource.notify_waiters();
 	}
+}
+
+/// Represent the response to method call.
+#[derive(Debug)]
+pub struct MethodResponse {
+	/// Serialized JSON-RPC response,
+	pub result: String,
+	/// Indicates whether the call was successful or not.
+	pub success: bool,
+}
+
+impl MethodResponse {
+	/// Send a JSON-RPC response to the client. If the serialization of `result` exceeds `max_response_size`,
+	/// an error will be sent instead.
+	pub fn response(id: Id, result: impl Serialize, max_response_size: usize) -> Self {
+		let mut writer = BoundedWriter::new(max_response_size);
+
+		match serde_json::to_writer(&mut writer, &Response::new(result, id.clone())) {
+			Ok(_) => {
+				// Safety - serde_json does not emit invalid UTF-8.
+				let result = unsafe { String::from_utf8_unchecked(writer.into_bytes()) };
+				Self { result, success: true }
+			}
+			Err(err) => {
+				tracing::error!("Error serializing response: {:?}", err);
+
+				if err.is_io() {
+					let data = format!("Exceeded max limit of {}", max_response_size);
+					let err = ErrorObject::owned(OVERSIZED_RESPONSE_CODE, OVERSIZED_RESPONSE_MSG, Some(data));
+					let result = serde_json::to_string(&ErrorResponse::borrowed(err, id)).unwrap();
+
+					Self { result, success: false }
+				} else {
+					let result =
+						serde_json::to_string(&ErrorResponse::borrowed(ErrorCode::InternalError.into(), id)).unwrap();
+					Self { result, success: false }
+				}
+			}
+		}
+	}
+
+	/// Create a `MethodResponse` from an error.
+	pub fn error<'a>(id: Id, err: impl Into<ErrorObject<'a>>) -> Self {
+		let result = serde_json::to_string(&ErrorResponse::borrowed(err.into(), id)).unwrap();
+		Self { result, success: false }
+	}
+}
+
+/// Builder to build a `BatchResponse`.
+#[derive(Debug)]
+pub struct BatchResponseBuilder {
+	/// Serialized JSON-RPC response,
+	result: String,
+	/// Indicates whether the call was successful or not.
+	success: bool,
+}
+
+impl BatchResponseBuilder {
+	/// Create a new batch response builder.
+	pub fn new() -> Self {
+		Self { result: String::from("["), success: true }
+	}
+
+	/// Append a result from an individual method to the batch response.
+	pub fn append(&mut self, response: &MethodResponse) {
+		if !response.success {
+			self.success = false;
+		}
+
+		self.result.push_str(&response.result);
+		self.result.push(',');
+	}
+
+	/// Finish the batch response
+	pub fn finish(mut self) -> BatchResponse {
+		if self.result.len() == 1 {
+			panic!("Batch response needs at least one item");
+		}
+
+		self.result.pop();
+		self.result.push(']');
+		BatchResponse { result: self.result, success: self.success }
+	}
+}
+
+/// Response to a batch request.
+#[derive(Debug)]
+pub struct BatchResponse {
+	/// Formatted JSON-RPC response.
+	pub result: String,
+	/// Indicates whether the call was successful or not.
+	pub success: bool,
+}
+
+impl BatchResponse {
+	/// Create a `BatchResponse` from an error.
+	pub fn error(id: Id, err: impl Into<ErrorObject<'static>>) -> Self {
+		let result = serde_json::to_string(&ErrorResponse::borrowed(err.into(), id)).unwrap();
+		Self { result, success: false }
+	}
+}
+
+/// Read all the results of all method calls in a batch request from the ['Stream']. Format the result into a single
+/// `String` appropriately wrapped in `[`/`]`.
+pub async fn collect_batch_response(rx: mpsc::UnboundedReceiver<String>) -> String {
+	let mut buf = String::with_capacity(2048);
+	buf.push('[');
+	let mut buf = rx
+		.fold(buf, |mut acc, response| async move {
+			acc.push_str(&response);
+			acc.push(',');
+			acc
+		})
+		.await;
+	// Remove trailing comma
+	buf.pop();
+	buf.push(']');
+	buf
 }
 
 #[cfg(test)]

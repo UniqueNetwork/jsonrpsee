@@ -24,7 +24,7 @@
 // IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use std::collections::HashMap;
+/*use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -194,3 +194,4 @@ async fn http_server_middleware() {
 	// HTTP server doesn't track connections
 	assert_eq!(inner.connections, (0, 0));
 }
+*/

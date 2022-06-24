@@ -34,6 +34,7 @@ use crate::response::{internal_error, malformed};
 use futures_channel::mpsc;
 use futures_util::{future::join_all, stream::StreamExt, FutureExt};
 use hyper::header::{HeaderMap, HeaderValue};
+use hyper::server::conn::AddrStream;
 use hyper::server::{conn::AddrIncoming, Builder as HyperBuilder};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Error as HyperError, Method};
@@ -41,9 +42,9 @@ use jsonrpsee_core::error::{Error, GenericTransportError};
 use jsonrpsee_core::http_helpers::{self, read_body};
 use jsonrpsee_core::middleware::Middleware;
 use jsonrpsee_core::server::access_control::AccessControl;
-use jsonrpsee_core::server::helpers::{collect_batch_response, prepare_error, MethodSink};
+use jsonrpsee_core::server::helpers::{prepare_error, MethodSink};
 use jsonrpsee_core::server::resource_limiting::Resources;
-use jsonrpsee_core::server::rpc_module::{MethodKind, Methods};
+use jsonrpsee_core::server::rpc_module::{MessageWithMiddleware, MethodKind, Methods};
 use jsonrpsee_core::tracing::{rx_log_from_json, RpcTracing};
 use jsonrpsee_core::TEN_MB_SIZE_BYTES;
 use jsonrpsee_types::error::{ErrorCode, ErrorObject, BATCHES_NOT_SUPPORTED_CODE, BATCHES_NOT_SUPPORTED_MSG};
@@ -410,12 +411,13 @@ impl<M: Middleware> Server<M> {
 		let methods = methods.into().initialize_resources(&resources)?;
 		let health_api = self.health_api;
 
-		let make_service = make_service_fn(move |_| {
+		let make_service = make_service_fn(move |conn: &AddrStream| {
 			let methods = methods.clone();
 			let acl = acl.clone();
 			let resources = resources.clone();
 			let middleware = middleware.clone();
 			let health_api = health_api.clone();
+			let remote_addr = conn.remote_addr();
 
 			async move {
 				Ok::<_, HyperError>(service_fn(move |request| {
@@ -491,6 +493,7 @@ impl<M: Middleware> Server<M> {
 									max_response_body_size,
 									max_log_length,
 									batch_requests_supported,
+									remote_addr,
 								)
 								.await?;
 
@@ -578,8 +581,11 @@ async fn process_validated_request(
 	max_response_body_size: u32,
 	max_log_length: u32,
 	batch_requests_supported: bool,
+	remote_addr: SocketAddr,
 ) -> Result<hyper::Response<hyper::Body>, HyperError> {
 	let (parts, body) = request.into_parts();
+
+	let request_start = middleware.on_request(remote_addr, &parts.headers);
 
 	let (body, mut is_single) = match read_body(&parts.headers, body, max_request_body_size).await {
 		Ok(r) => r,
@@ -591,10 +597,8 @@ async fn process_validated_request(
 		}
 	};
 
-	let request_start = middleware.on_request();
-
 	// NOTE(niklasad1): it's a channel because it's needed for batch requests.
-	let (tx, mut rx) = mpsc::unbounded::<String>();
+	let (tx, mut rx) = mpsc::unbounded::<MessageWithMiddleware>();
 	let sink = MethodSink::new_with_limit(tx, max_response_body_size, max_log_length);
 
 	type Notif<'a> = Notification<'a, Option<&'a RawValue>>;
@@ -608,14 +612,15 @@ async fn process_validated_request(
 			let _enter = trace.span().enter();
 
 			rx_log_from_json(&req, max_log_length);
-			middleware.on_call(method);
 
 			let id = req.id.clone();
 			let params = Params::new(req.params.map(|params| params.get()));
 
+			middleware.on_call(method, params.clone());
+
 			let result = match methods.method_with_name(method) {
 				None => {
-					sink.send_error(req.id, ErrorCode::MethodNotFound.into());
+					sink.send_error(req.id, ErrorCode::MethodNotFound.into(), request_start);
 					false
 				}
 				Some((name, method_callback)) => match method_callback.inner() {
@@ -627,7 +632,7 @@ async fn process_validated_request(
 						}
 						Err(err) => {
 							tracing::error!("[Methods::execute_with_resources] failed to lock resources: {:?}", err);
-							sink.send_error(req.id, ErrorCode::ServerIsBusy.into());
+							sink.send_error(req.id, ErrorCode::ServerIsBusy.into(), request_start);
 							false
 						}
 					},
@@ -641,13 +646,13 @@ async fn process_validated_request(
 						}
 						Err(err) => {
 							tracing::error!("[Methods::execute_with_resources] failed to lock resources: {:?}", err);
-							sink.send_error(req.id, ErrorCode::ServerIsBusy.into());
+							sink.send_error(req.id, ErrorCode::ServerIsBusy.into(), request_start);
 							false
 						}
 					},
 					MethodKind::Subscription(_) | MethodKind::Unsubscription(_) => {
 						tracing::error!("Subscriptions not supported on HTTP");
-						sink.send_error(req.id, ErrorCode::InternalError.into());
+						sink.send_error(req.id, ErrorCode::InternalError.into(), request_start);
 						false
 					}
 				},
@@ -662,7 +667,7 @@ async fn process_validated_request(
 			return Ok::<_, HyperError>(response::ok_response("".into()));
 		} else {
 			let (id, code) = prepare_error(&body);
-			sink.send_error(id, code.into());
+			sink.send_error(id, code.into(), request_start);
 		}
 	// Batch of requests or notifications
 	} else if let Ok(batch) = serde_json::from_slice::<Vec<Request>>(&body) {
@@ -677,24 +682,22 @@ async fn process_validated_request(
 			sink.send_error(
 				Id::Null,
 				ErrorObject::borrowed(BATCHES_NOT_SUPPORTED_CODE, &BATCHES_NOT_SUPPORTED_MSG, None),
+				request_start,
 			);
 		} else if !batch.is_empty() {
-			let middleware = &middleware;
-
 			join_all(batch.into_iter().filter_map(move |req| {
 				let id = req.id.clone();
 				let params = Params::new(req.params.map(|params| params.get()));
 
 				match methods.method_with_name(&req.method) {
 					None => {
-						sink.send_error(req.id, ErrorCode::MethodNotFound.into());
+						sink.send_error(req.id, ErrorCode::MethodNotFound.into(), request_start);
 						None
 					}
 					Some((name, method_callback)) => match method_callback.inner() {
 						MethodKind::Sync(callback) => match method_callback.claim(name, &resources) {
 							Ok(guard) => {
 								let result = (callback)(id, params, &sink);
-								middleware.on_result(name, result, request_start);
 								drop(guard);
 								None
 							}
@@ -703,8 +706,7 @@ async fn process_validated_request(
 									"[Methods::execute_with_resources] failed to lock resources: {:?}",
 									err
 								);
-								sink.send_error(req.id, ErrorCode::ServerIsBusy.into());
-								middleware.on_result(name, false, request_start);
+								sink.send_error(req.id, ErrorCode::ServerIsBusy.into(), request_start);
 								None
 							}
 						},
@@ -716,8 +718,7 @@ async fn process_validated_request(
 								let callback = callback.clone();
 
 								Some(async move {
-									let result = (callback)(id, params, sink, 0, Some(guard)).in_current_span().await;
-									middleware.on_result(name, result, request_start);
+									let _result = (callback)(id, params, sink, 0, Some(guard)).in_current_span().await;
 								})
 							}
 							Err(err) => {
@@ -725,15 +726,13 @@ async fn process_validated_request(
 									"[Methods::execute_with_resources] failed to lock resources: {:?}",
 									err
 								);
-								sink.send_error(req.id, ErrorCode::ServerIsBusy.into());
-								middleware.on_result(name, false, request_start);
+								sink.send_error(req.id, ErrorCode::ServerIsBusy.into(), request_start);
 								None
 							}
 						},
 						MethodKind::Subscription(_) | MethodKind::Unsubscription(_) => {
 							tracing::error!("Subscriptions not supported on HTTP");
-							sink.send_error(req.id, ErrorCode::InternalError.into());
-							middleware.on_result(&req.method, false, request_start);
+							sink.send_error(req.id, ErrorCode::InternalError.into(), request_start);
 							None
 						}
 					},
@@ -745,7 +744,7 @@ async fn process_validated_request(
 			// Array with at least one value, the response from the Server MUST be a single
 			// Response object." – The Spec.
 			is_single = true;
-			sink.send_error(Id::Null, ErrorCode::InvalidRequest.into());
+			sink.send_error(Id::Null, ErrorCode::InvalidRequest.into(), request_start);
 		}
 	} else if let Ok(_batch) = serde_json::from_slice::<Vec<Notif>>(&body) {
 		return Ok(response::ok_response("".into()));
@@ -755,19 +754,42 @@ async fn process_validated_request(
 		// Response object." – The Spec.
 		is_single = true;
 		let (id, code) = prepare_error(&body);
-		sink.send_error(id, code.into());
+		sink.send_error(id, code.into(), request_start);
 	};
 
-	// Closes the receiving half of a channel without dropping it. This prevents any further
-	// messages from being sent on the channel.
-	rx.close();
 	let response = if is_single {
-		rx.next().await.expect("Sender is still alive managed by us above; qed")
+		match rx.next().await.expect("one response should have been produced") {
+			MessageWithMiddleware::Call { method, started_at, response } => {
+				middleware.on_result(&method, response.success, started_at);
+				middleware.on_response(&response.result, started_at);
+
+				response.result
+			}
+			MessageWithMiddleware::Notif(_) => unreachable!(),
+		}
 	} else {
-		collect_batch_response(rx).await
+		let mut batch = String::from("[");
+
+		while let Some(res) = rx.next().await {
+			match res {
+				MessageWithMiddleware::Call { method, started_at, response } => {
+					middleware.on_result(&method, response.success, started_at);
+
+					batch.push_str(&response.result);
+					batch.push(',');
+				}
+				MessageWithMiddleware::Notif(_) => unreachable!(),
+			};
+		}
+
+		batch.pop();
+		batch.push(']');
+
+		middleware.on_response(&batch, request_start);
+
+		batch
 	};
 
-	middleware.on_response(request_start);
 	Ok(response::ok_response(response))
 }
 
@@ -778,44 +800,36 @@ async fn process_health_request(
 	max_response_body_size: u32,
 	max_log_length: u32,
 ) -> Result<hyper::Response<hyper::Body>, HyperError> {
-	let (tx, mut rx) = mpsc::unbounded::<String>();
+	let (tx, mut rx) = mpsc::unbounded();
 	let sink = MethodSink::new_with_limit(tx, max_response_body_size, max_log_length);
-
-	let request_start = middleware.on_request();
 
 	let success = match methods.method_with_name(&health_api.method) {
 		None => false,
 		Some((name, method_callback)) => match method_callback.inner() {
 			MethodKind::Sync(callback) => {
 				let res = (callback)(Id::Number(0), Params::new(None), &sink);
-				middleware.on_result(name, res, request_start);
 				res
 			}
 			MethodKind::Async(callback) => {
 				let res = (callback)(Id::Number(0), Params::new(None), sink.clone(), 0, None).await;
-				middleware.on_result(name, res, request_start);
 				res
 			}
 
-			MethodKind::Subscription(_) | MethodKind::Unsubscription(_) => {
-				middleware.on_result(name, false, request_start);
-				false
-			}
+			MethodKind::Subscription(_) | MethodKind::Unsubscription(_) => false,
 		},
 	};
 
 	let data = rx.next().await;
-	middleware.on_response(request_start);
 
 	match data {
-		Some(data) if success => {
+		Some(MessageWithMiddleware::Call { method, started_at, response }) if success => {
 			#[derive(serde::Deserialize)]
 			struct RpcPayload<'a> {
 				#[serde(borrow)]
 				result: &'a serde_json::value::RawValue,
 			}
 
-			let payload: RpcPayload = serde_json::from_str(&data)
+			let payload: RpcPayload = serde_json::from_str(&response.result)
 				.expect("valid JSON-RPC response must have a result field and be valid JSON; qed");
 			Ok(response::ok_response(payload.result.to_string()))
 		}

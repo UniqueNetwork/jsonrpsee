@@ -30,8 +30,10 @@ use std::net::SocketAddr;
 use std::process::Command;
 use std::time::Instant;
 
+use jsonrpsee::core::middleware::Headers;
 use jsonrpsee::core::{client::ClientT, middleware};
 use jsonrpsee::rpc_params;
+use jsonrpsee::types::Params;
 use jsonrpsee::ws_client::WsClientBuilder;
 use jsonrpsee::ws_server::{RpcModule, WsServerBuilder};
 
@@ -40,21 +42,21 @@ use jsonrpsee::ws_server::{RpcModule, WsServerBuilder};
 struct Timings;
 
 impl middleware::Middleware for Timings {
-	type Instant = Instant;
+	//type Instant = Instant;
 
-	fn on_request(&self) -> Self::Instant {
+	fn on_request(&self, _remote_addr: SocketAddr, _headers: &Headers) -> Instant {
 		Instant::now()
 	}
 
-	fn on_call(&self, name: &str) {
-		println!("[Timings] They called '{}'", name);
+	fn on_call(&self, name: &str, params: Params) {
+		println!("[Timings] They called '{}' {:?}", name, params);
 	}
 
-	fn on_result(&self, name: &str, succeess: bool, started_at: Self::Instant) {
+	fn on_result(&self, name: &str, succeess: bool, started_at: Instant) {
 		println!("[Timings] call={}, worked? {}, duration {:?}", name, succeess, started_at.elapsed());
 	}
 
-	fn on_response(&self, started_at: Self::Instant) {
+	fn on_response(&self, _result: &str, started_at: Instant) {
 		println!("[Timings] Response duration {:?}", started_at.elapsed());
 	}
 }
@@ -79,17 +81,19 @@ impl ThreadWatcher {
 }
 
 impl middleware::Middleware for ThreadWatcher {
-	type Instant = isize;
+	//type Instant = isize;
 
-	fn on_request(&self) -> Self::Instant {
-		let threads = Self::count_threads();
+	fn on_request(&self, _remote_addr: SocketAddr, _headers: &Headers) -> Instant {
+		/*let threads = Self::count_threads();
 		println!("[ThreadWatcher] Threads running on the machine at the start of a call: {}", threads);
-		threads as isize
+		threads as isize*/
+		todo!();
 	}
 
-	fn on_response(&self, started_at: Self::Instant) {
-		let current_nr_threads = Self::count_threads() as isize;
-		println!("[ThreadWatcher] Request started {} threads", current_nr_threads - started_at);
+	fn on_response(&self, _result: &str, started_at: Instant) {
+		/*let current_nr_threads = Self::count_threads() as isize;
+		println!("[ThreadWatcher] Request started {} threads", current_nr_threads - started_at);*/
+		todo!();
 	}
 }
 
@@ -114,7 +118,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_server() -> anyhow::Result<SocketAddr> {
-	let server = WsServerBuilder::new().set_middleware((Timings, ThreadWatcher)).build("127.0.0.1:0").await?;
+	let server = WsServerBuilder::new() /*.set_middleware((Timings, ThreadWatcher))*/
+		.build("127.0.0.1:0")
+		.await?;
 	let mut module = RpcModule::new(());
 	module.register_method("say_hello", |_, _| Ok("lo"))?;
 	module.register_method("thready", |params, _| {
